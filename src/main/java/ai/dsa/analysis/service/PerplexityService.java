@@ -51,58 +51,50 @@ public class PerplexityService {
     }
 
 
-    // ✅ Simple constructor with single parameter
-    public PerplexityService(PerplexityProperties properties) {
+    public PerplexityService(@Qualifier("perplexityWebClient") WebClient webClient,
+                             PerplexityProperties properties) {
+        this.webClient = webClient;
         this.properties = properties;
-        this.webClient = WebClient.builder().build();
-
-        log.info("🤖 Perplexity service initialized with model: {}",
-                properties != null ? properties.getModel() : "null");
+        log.info("🤖 Perplexity service initialized with model: {}", properties.getModel());
     }
 
     public String analyzeUserCodingPatterns(UserCodingData userData) {
         log.info("🔍 Starting AI analysis for user: {}", userData.getUserId());
+        log.debug("🔑 API key prefix: {}...",
+                properties.getKey() != null ? properties.getKey().substring(0, 8) : "null");
 
-        // ✅ Check configuration properly
-        if (properties.getKey() == null || properties.getKey().equals("not-configured") || properties.getKey().trim().isEmpty()) {
-            log.warn("⚠️ Perplexity API key not configured, using fallback");
+        // Build prompt
+        String prompt = buildDetailedAnalysisPrompt(userData);
+        log.debug("📝 Prompt sent to AI:\n{}", prompt);
+
+        // Call Perplexity API
+        Mono<String> responseMono = callPerplexityAPI(prompt)
+                .doOnNext(resp -> log.debug("📋 Raw AI response JSON: {}", resp))
+                .timeout(Duration.ofMillis(properties.getTimeout()))
+                .retryWhen(Retry.backoff(2, Duration.ofSeconds(1)));
+
+        // Block to get the response
+        String aiResponse = responseMono.block();
+        if (aiResponse == null || aiResponse.isBlank()) {
+            log.warn("⚠️ Empty AI response, returning fallback");
             return generateFallbackAnalysis(userData);
         }
 
-        try {
-            String prompt = buildDetailedAnalysisPrompt(userData);
-            log.debug("📝 Generated prompt for AI: {}", prompt.substring(0, Math.min(200, prompt.length())) + "...");
-
-            String response = callPerplexityAPI(prompt)
-                    .timeout(Duration.ofSeconds(properties.getTimeout() / 1000))
-                    .block();
-
-            if (response != null && !response.trim().isEmpty()) {
-                log.info("✅ AI analysis successful for user: {}", userData.getUserId());
-                return response;
-            } else {
-                log.warn("⚠️ Empty AI response, using fallback");
-                return generateFallbackAnalysis(userData);
-            }
-
-        } catch (Exception e) {
-            log.error("❌ AI analysis failed for user {}: {}", userData.getUserId(), e.getMessage(), e);
-            return generateFallbackAnalysis(userData);
-        }
+        log.info("✅ AI analysis successful for user: {}", userData.getUserId());
+        return aiResponse;
     }
 
     private Mono<String> callPerplexityAPI(String prompt) {
         Map<String, Object> requestBody = Map.of(
-                "model", properties.getModel(),  // ✅ Use injected model
+                "model", properties.getModel(),
                 "messages", List.of(
-                        Map.of("role", "system", "content", "You are an expert coding mentor and technical interviewer. Provide detailed, actionable insights about coding patterns and improvement recommendations."),
+                        Map.of("role", "system", "content",
+                                "You are an expert coding mentor; give actionable coding insights."),
                         Map.of("role", "user", "content", prompt)
                 ),
-                "max_tokens", properties.getMaxTokens(),  // ✅ Use injected config
+                "max_tokens", properties.getMaxTokens(),
                 "temperature", properties.getTemperature()
         );
-
-        log.debug("🚀 Calling Perplexity API at: {}", properties.getBaseUrl());
 
         return webClient.post()
                 .uri(properties.getBaseUrl() + "/chat/completions")
@@ -110,28 +102,15 @@ public class PerplexityService {
                 .header(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
                 .bodyValue(requestBody)
                 .retrieve()
-                .onStatus(status -> status.is4xxClientError(),
-                        response -> {
-                            log.error("🚫 API Client Error: {}", response.statusCode());
-                            return Mono.error(new RuntimeException("API authentication failed - check your API key"));
-                        })
-                .onStatus(status -> status.is5xxServerError(),
-                        response -> {
-                            log.error("🔥 API Server Error: {}", response.statusCode());
-                            return Mono.error(new RuntimeException("Perplexity API server error"));
-                        })
                 .bodyToMono(JsonNode.class)
                 .map(this::extractResponseContent)
-                .retryWhen(Retry.backoff(2, Duration.ofSeconds(1))
-                        .filter(throwable -> throwable instanceof WebClientResponseException.TooManyRequests))
-                .doOnError(error -> log.error("🚨 API call failed: {}", error.getMessage()));
+                .doOnError(err -> log.error("🚨 API call failed: {}", err.getMessage()));
     }
 
     private String extractResponseContent(JsonNode response) {
         try {
-            log.debug("📋 Parsing AI response");
             return response.path("choices")
-                    .path(0)
+                    .get(0)
                     .path("message")
                     .path("content")
                     .asText();
@@ -147,7 +126,7 @@ public class PerplexityService {
             
             📊 CODING ACTIVITY:
             - Problems attempted: %d
-            - Code executions: %d  
+            - Code executions: %d \s
             - Successful submissions: %d
             - Analysis period: %d days
             - Languages used: %s
@@ -155,15 +134,22 @@ public class PerplexityService {
             - Problem categories: %s
             
             🎯 PROVIDE DETAILED ANALYSIS:
-            1. **Problem-Solving Style**: Describe their approach (methodical, iterative, experimental, etc.)
-            2. **Initial Approach Rating** (1-5): Rate how well they plan before coding
-            3. **Code Quality Score** (1-5): Assess efficiency and best practices
-            4. **Key Strengths**: What they do well (3-4 specific strengths)
-            5. **Areas for Improvement**: Specific weaknesses to address (3-4 areas)
-            6. **Actionable Recommendations**: Concrete next steps for improvement
-            7. **Learning Path**: Suggested topics/resources for continued growth
+            1. **Problem-Solving Style**: Describe their overall style (methodical, brute-force-first, optimization-focused, etc.)
+            2. **Initial Approach Quality (1-5)**: How effective is their first attempt? Compare with how they solve similar problems later. Identify gaps in planning.
+            3. **Test Case Thinking**: Evaluate how well they anticipate edge cases, corner scenarios, and tricky inputs.
+            4. **Edge Case Handling**: Were unusual inputs and boundary conditions handled systematically or missed?
+            5. **Complexity Awareness**: Did they consider time/space tradeoffs? Highlight cases of over-engineering or under-optimizing.
+            6. **Error Pattern Analysis**: Identify common recurring mistakes (off-by-one, incorrect conditions, data structure misuse, etc.) and suggest prevention strategies.
+            7. **Debugging & Iteration Style**: Assess how they handle failed attempts—quick fixes, structured debugging, or random retries.
+            8. **Code Quality Score (1-5)**: Efficiency, readability, and adherence to best practices.
+            9. **Key Strengths**: List 3–4 areas they excel at.
+            10. **Areas for Improvement**: List 3–4 targeted weaknesses.
+            11. **Actionable Recommendations**: Concrete, step-by-step improvements (e.g., “create a checklist for edge cases before coding”).
+            12. **Learning Path**: Suggested topics, patterns, or resources to improve their weak areas.
+            13. **Consistency & Growth**: Highlight whether they are improving, stagnating, or regressing over the analysis period.
             
-            Please provide specific, actionable insights based on the data patterns. 
+
+            Please provide specific, actionable insights based on the data patterns.
             Format your response with clear sections and be constructive in your feedback.
             """,
                 userData.getTotalProblems(),

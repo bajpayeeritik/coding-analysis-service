@@ -20,16 +20,20 @@ public class WebClientConfig {
     }
 
     private ExchangeFilterFunction logRequest() {
-        return ExchangeFilterFunction.ofRequestProcessor(clientRequest -> {
-            log.debug("🔍 AI Request: {} {}", clientRequest.method(), clientRequest.url());
-            return Mono.just(clientRequest);
+        return ExchangeFilterFunction.ofRequestProcessor(request -> {
+            log.debug("🔍 API Request: {} {}", request.method(), request.url());
+            request.headers().forEach((name, values) ->
+                    values.forEach(value -> log.debug("📤 Request Header: {}={}", name, value)));
+            return Mono.just(request);
         });
     }
 
     private ExchangeFilterFunction logResponse() {
-        return ExchangeFilterFunction.ofResponseProcessor(clientResponse -> {
-            log.debug("📥 AI Response Status: {}", clientResponse.statusCode());
-            return Mono.just(clientResponse);
+        return ExchangeFilterFunction.ofResponseProcessor(response -> {
+            log.debug("📥 API Response Status: {}", response.statusCode());
+            response.headers().asHttpHeaders().forEach((name, values) ->
+                    values.forEach(value -> log.debug("📥 Response Header: {}={}", name, value)));
+            return Mono.just(response);
         });
     }
 }
